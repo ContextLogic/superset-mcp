@@ -101,8 +101,13 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     """Manage application lifecycle for Superset integration"""
     logger.info("Initializing Superset context...")
 
-    # Create HTTP client
-    client = httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=30.0)
+    # Some Superset / proxy setups reject POST/PUT without a browser-like Referer.
+    referer = SUPERSET_BASE_URL.rstrip("/") + "/"
+    client = httpx.AsyncClient(
+        base_url=SUPERSET_BASE_URL,
+        timeout=30.0,
+        headers={"Referer": referer},
+    )
 
     # Create context
     ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
@@ -1088,20 +1093,90 @@ async def superset_database_validate_parameters(
 # ===== Dataset Tools =====
 
 
+def _dataset_list_rison_value(value: str) -> str:
+    """Encode a filter value for Superset list REST `q` (Rison) parameters."""
+    if not value:
+        return "''"
+    safe = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    )
+    if all(c in safe for c in value):
+        return value
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _build_dataset_list_params(
+    table_name: Optional[str] = None,
+    schema: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    q: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build GET /api/v1/dataset/ query params. Superset expects filters and pagination
+    inside a single Rison-encoded ``q`` string.
+    """
+    if q is not None:
+        return {"q": q}
+    parts: List[str] = []
+    filters: List[str] = []
+    if schema is not None:
+        filters.append(
+            f"(col:schema,opr:eq,value:{_dataset_list_rison_value(schema)})"
+        )
+    if table_name is not None:
+        filters.append(
+            f"(col:table_name,opr:eq,value:{_dataset_list_rison_value(table_name)})"
+        )
+    if filters:
+        parts.append("filters:!(" + ",".join(filters) + ")")
+    if page is not None:
+        parts.append(f"page:{int(page)}")
+    if page_size is not None:
+        parts.append(f"page_size:{int(page_size)}")
+    if not parts:
+        return None
+    return {"q": "(" + ",".join(parts) + ")"}
+
+
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dataset_list(
+    ctx: Context,
+    table_name: Optional[str] = None,
+    schema: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    q: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Get a list of datasets from Superset
 
     Makes a request to the /api/v1/dataset/ endpoint to retrieve all datasets
     the current user has access to view. Results are paginated.
 
+    Args:
+        table_name: If set, only datasets whose physical ``table_name`` matches (exact).
+        schema: If set, only datasets in this schema (exact). Combine with ``table_name``
+            to narrow large instances (e.g. ``sweeper`` + ``merchant_transaction_realtime``).
+        page: Zero-based page index (sent inside ``q`` when any filter or page_* is used).
+        page_size: Page size (sent inside ``q`` when any filter or page_* is used).
+        q: Advanced: full Rison ``q`` string; if set, overrides ``table_name`` / ``schema`` /
+            ``page`` / ``page_size``.
+
     Returns:
         A dictionary containing dataset information including id, table_name, and database
     """
-    return await make_api_request(ctx, "get", "/api/v1/dataset/")
+    params = _build_dataset_list_params(
+        table_name=table_name,
+        schema=schema,
+        page=page,
+        page_size=page_size,
+        q=q,
+    )
+    return await make_api_request(ctx, "get", "/api/v1/dataset/", params=params)
 
 
 @mcp.tool()
